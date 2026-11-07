@@ -1,0 +1,8 @@
+{
+  "name": "BrandGuard AI",
+  "description": "Enterprise closed-knowledge brand governance & content verification platform powered by Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
