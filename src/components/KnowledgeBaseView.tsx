@@ -17,7 +17,7 @@ import {
 import { Brand, KnowledgeDocument, KnowledgeChunk, DocumentType, UserRole } from '../types';
 import { StorageService } from '../services/storage';
 import { DocumentParser } from '../services/parser';
-import { BM25Retriever, ScoredChunk } from '../services/retrieval';
+import { VectorSimilarityRetriever, BM25Retriever, ScoredChunk } from '../services/retrieval';
 
 interface KnowledgeBaseViewProps {
   activeBrand: Brand;
@@ -37,10 +37,12 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [selectedDocForChunks, setSelectedDocForChunks] = useState<KnowledgeDocument | null>(null);
 
-  // BM25 Retrieval Sandbox Query State
+  // Semantic / Vector Retrieval Sandbox Query State
   const [testQuery, setTestQuery] = useState('productivity improvement benchmark');
+  const [retrievalEngine, setRetrievalEngine] = useState<'vector' | 'bm25'>('vector');
   const [retrievedResults, setRetrievedResults] = useState<ScoredChunk[]>([]);
   const [hasQueried, setHasQueried] = useState(false);
+  const [isSearching, setIsSearching] = useState(false);
 
   // Manual Document modal / form state
   const [showManualModal, setShowManualModal] = useState(false);
@@ -87,9 +89,16 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
           id: `chunk-${docId}-${cIdx + 1}`,
           documentId: docId,
           brandId: activeBrand.id,
+          documentVersion: newDoc.version,
         }));
 
-        StorageService.saveDocument(newDoc, chunkObjects);
+        // Generate semantic vector embeddings once on upload
+        const embeddedChunks = await VectorSimilarityRetriever.generateChunkEmbeddings(
+          chunkObjects,
+          newDoc.version
+        );
+
+        StorageService.saveDocument(newDoc, embeddedChunks);
       }
 
       onRefreshData();
@@ -101,7 +110,7 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
     }
   };
 
-  const handleCreateManualDoc = () => {
+  const handleCreateManualDoc = async () => {
     if (!manualTitle.trim() || !manualContent.trim()) return;
 
     const docId = `doc-manual-${Date.now()}`;
@@ -124,9 +133,16 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
       id: `chunk-${docId}-${cIdx + 1}`,
       documentId: docId,
       brandId: activeBrand.id,
+      documentVersion: manualVersion,
     }));
 
-    StorageService.saveDocument(newDoc, chunkObjects);
+    // Generate semantic vector embeddings once on document creation
+    const embeddedChunks = await VectorSimilarityRetriever.generateChunkEmbeddings(
+      chunkObjects,
+      manualVersion
+    );
+
+    StorageService.saveDocument(newDoc, embeddedChunks);
     onRefreshData();
     setShowManualModal(false);
     setManualTitle('');
@@ -143,11 +159,23 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
     }
   };
 
-  const handleRunBM25Test = () => {
+  const handleRunSearch = async () => {
     if (!testQuery.trim()) return;
-    const results = BM25Retriever.retrieve(testQuery, chunks, 4);
-    setRetrievedResults(results);
-    setHasQueried(true);
+    setIsSearching(true);
+    try {
+      if (retrievalEngine === 'vector') {
+        const results = await VectorSimilarityRetriever.retrieve(testQuery, chunks, 4);
+        setRetrievedResults(results);
+      } else {
+        const results = BM25Retriever.retrieve(testQuery, chunks, 4);
+        setRetrievedResults(results);
+      }
+      setHasQueried(true);
+    } catch (e) {
+      console.error('Search retrieval error:', e);
+    } finally {
+      setIsSearching(false);
+    }
   };
 
   return (
@@ -313,16 +341,46 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
         </div>
       </div>
 
-      {/* BM25 Retrieval Sandbox / Test Query Section */}
+      {/* Semantic Vector Retrieval Sandbox / Test Query Section */}
       <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-xs space-y-4">
-        <div>
-          <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
-            <Search className="w-4 h-4 text-blue-600" />
-            BM25 Closed-Knowledge Retrieval Inspector
-          </h3>
-          <p className="text-xs text-slate-500 mt-0.5">
-            Test how claims are matched against approved knowledge base chunks. Only top-ranked chunks are provided to Gemini for verification.
-          </p>
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 pb-2 border-b border-slate-100">
+          <div>
+            <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-blue-600" />
+              Engine 2: Semantic Evidence Retrieval Inspector
+            </h3>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Verify claims using dense semantic embeddings and cosine vector similarity (pgvector). Only the top-k retrieved chunks are sent to the LLM.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2 self-start md:self-auto">
+            <span className="text-xs text-slate-500 font-medium">Method:</span>
+            <div className="inline-flex rounded-lg border border-slate-200 p-0.5 bg-slate-50 text-xs">
+              <button
+                type="button"
+                onClick={() => setRetrievalEngine('vector')}
+                className={`px-2.5 py-1 rounded-md font-medium transition-colors ${
+                  retrievalEngine === 'vector'
+                    ? 'bg-blue-600 text-white shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Semantic Vector
+              </button>
+              <button
+                type="button"
+                onClick={() => setRetrievalEngine('bm25')}
+                className={`px-2.5 py-1 rounded-md font-medium transition-colors ${
+                  retrievalEngine === 'bm25'
+                    ? 'bg-blue-600 text-white shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                BM25 Keyword
+              </button>
+            </div>
+          </div>
         </div>
 
         <div className="flex gap-2">
@@ -330,16 +388,17 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
             type="text"
             value={testQuery}
             onChange={(e) => setTestQuery(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleRunBM25Test()}
-            placeholder="Type a marketing claim or query to test retrieval (e.g. productivity improvement, 99.95% SLA, pricing)..."
+            onKeyDown={(e) => e.key === 'Enter' && handleRunSearch()}
+            placeholder="Type a claim or query to test retrieval (e.g. productivity improvement, 99.95% SLA, pricing Rs 499, credit card support)..."
             className="flex-1 text-xs bg-slate-50 border border-slate-300 rounded-lg px-3.5 py-2.5 text-slate-900 focus:outline-none focus:ring-1 focus:ring-blue-600"
           />
           <button
-            onClick={handleRunBM25Test}
-            className="px-4 py-2.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors inline-flex items-center gap-2 shadow-xs shrink-0"
+            onClick={handleRunSearch}
+            disabled={isSearching}
+            className="px-4 py-2.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors inline-flex items-center gap-2 shadow-xs shrink-0 disabled:opacity-50"
           >
-            <Search className="w-3.5 h-3.5" />
-            Run BM25 Match
+            <Search className={`w-3.5 h-3.5 ${isSearching ? 'animate-spin' : ''}`} />
+            {isSearching ? 'Retrieving...' : `Retrieve (${retrievalEngine === 'vector' ? 'Vector' : 'BM25'})`}
           </button>
         </div>
 
@@ -349,7 +408,9 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
             <div className="text-xs font-semibold text-slate-700 flex items-center justify-between">
               <span>Retrieved Evidence Chunks ({retrievedResults.length} matches):</span>
               <span className="text-[11px] text-slate-400 font-mono">
-                BM25 k1=1.5, b=0.75
+                {retrievalEngine === 'vector'
+                  ? 'Cosine Vector Similarity (top-k = 4)'
+                  : 'BM25 k1=1.5, b=0.75'}
               </span>
             </div>
 
@@ -373,9 +434,18 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
                         <span className="text-slate-400">·</span>
                         <span className="text-slate-600">{item.chunk.section}</span>
                       </div>
-                      <span className="font-mono text-[11px] text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
-                        BM25 Score: {item.score.toFixed(3)}
-                      </span>
+                      <div className="flex items-center gap-2">
+                        {item.matchType && (
+                          <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200">
+                            {item.matchType}
+                          </span>
+                        )}
+                        <span className="font-mono text-[11px] text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
+                          {retrievalEngine === 'vector'
+                            ? `Similarity: ${(item.score * 100).toFixed(1)}%`
+                            : `BM25 Score: ${item.score.toFixed(3)}`}
+                        </span>
+                      </div>
                     </div>
                     <p className="text-slate-700 leading-relaxed font-sans bg-white p-2.5 rounded border border-slate-200">
                       "{item.chunk.text}"
@@ -419,7 +489,18 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
                   >
                     <div className="flex items-center justify-between font-semibold text-slate-900">
                       <span>Chunk #{idx + 1}: {chunk.section}</span>
-                      <span className="font-mono text-slate-500">~{chunk.tokenCount} tokens</span>
+                      <div className="flex items-center gap-2">
+                        {chunk.embedding && chunk.embedding.length > 0 ? (
+                          <span className="text-[10px] font-mono text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded">
+                            {chunk.embedding.length}d embedded ({chunk.embeddingModel || 'vector'})
+                          </span>
+                        ) : (
+                          <span className="text-[10px] font-mono text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded">
+                            Unembedded
+                          </span>
+                        )}
+                        <span className="font-mono text-slate-500">~{chunk.tokenCount} tokens</span>
+                      </div>
                     </div>
                     <p className="text-slate-700 leading-relaxed bg-white p-3 rounded border border-slate-200">
                       {chunk.text}

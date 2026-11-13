@@ -6,19 +6,21 @@ import {
 } from '../types';
 import { StorageService } from './storage';
 import { DeterministicRulesEngine } from './rules';
-import { BM25Retriever } from './retrieval';
+import { VectorSimilarityRetriever } from './retrieval';
+import { VisualIntelligenceEngine } from './visual';
 
 export class GeminiService {
   /**
-   * Simple string hash for caching (content + guidelineVersion + knowledgeBaseCount)
+   * Result caching keyed by hash of content + guideline version + knowledge-base version (+ optional visual salt)
    */
   public static computeHash(
     content: string,
     brandId: string,
     guidelineVersion: number,
-    chunkCount: number
+    kbVersion: string | number,
+    visualSalt: string = ''
   ): string {
-    const raw = `${brandId}_v${guidelineVersion}_c${chunkCount}_${content.trim()}`;
+    const raw = `${brandId}_gv${guidelineVersion}_kb${kbVersion}_${content.trim()}_${visualSalt}`;
     let hash = 0;
     for (let i = 0; i < raw.length; i++) {
       const char = raw.charCodeAt(i);
@@ -29,23 +31,35 @@ export class GeminiService {
   }
 
   /**
-   * Full analysis pipeline running Engine 1 (Brand) & Engine 2 (Evidence)
+   * Full analysis pipeline running Engine 1 (Brand), Engine 2 (Evidence), and Engine 3 (Visual)
    */
   public static async analyzeContent(
     content: string,
     brand: Brand,
     submissionId: string,
-    versionNumber: number
+    versionNumber: number,
+    options: {
+      visualAnalysis?: VisualAnalysisResult;
+      missingAltTextCount?: number;
+      documentName?: string;
+    } = {}
   ): Promise<AnalysisResult> {
     const brandChunks = StorageService.getChunksByBrand(brand.id);
+    const submission = StorageService.getSubmission(submissionId);
+    const visual = options.visualAnalysis || submission?.visualAnalysis;
+    const visualSalt = visual ? `${visual.complianceScore}_${visual.extractedText || ''}` : '';
+
+    const kbVersion = StorageService.getKnowledgeBaseVersion(brand.id);
+
     const hashKey = this.computeHash(
       content,
       brand.id,
       brand.guidelineVersion,
-      brandChunks.length
+      kbVersion,
+      visualSalt
     );
 
-    // 1. Check cache first
+    // 1. Check cache first (instant and identical re-run)
     const cached = StorageService.getAnalysis(hashKey);
     if (cached) {
       return {
@@ -56,6 +70,13 @@ export class GeminiService {
       };
     }
 
+    // 1b. Ensure chunk embeddings are computed and stored once per document version
+    const chunksNeedingEmbeddings = brandChunks.some((c) => !c.embedding || c.embedding.length === 0);
+    if (chunksNeedingEmbeddings) {
+      const updatedChunks = await VectorSimilarityRetriever.generateChunkEmbeddings(brandChunks);
+      StorageService.saveChunks(updatedChunks);
+    }
+
     // 2. Consume session review credit
     StorageService.useCredit();
 
@@ -64,6 +85,30 @@ export class GeminiService {
     // 3. ENGINE 1: Deterministic code checks first (no LLM latency)
     const deterministicFindings = DeterministicRulesEngine.evaluate(content, brand);
     allFindings.push(...deterministicFindings);
+
+    // 3b. ENGINE 1 on Visual Extracted Text (if image contains copy)
+    if (visual?.extractedText && visual.extractedText.trim().length > 0) {
+      const visualTextFindings = DeterministicRulesEngine.evaluate(
+        visual.extractedText,
+        brand,
+        'Image Graphic Text'
+      );
+      allFindings.push(...visualTextFindings);
+    }
+
+    // 3c. Incorporate Engine 3 Visual Findings (Palette Mismatch, Logo Mismatch)
+    if (visual?.findings && Array.isArray(visual.findings)) {
+      allFindings.push(...visual.findings);
+    }
+
+    // 3d. Check for missing alt-text in DOCX/HTML documents
+    if (options.missingAltTextCount && options.missingAltTextCount > 0) {
+      const altFinding = VisualIntelligenceEngine.createMissingAltTextFinding(
+        options.missingAltTextCount,
+        options.documentName || 'Uploaded Document'
+      );
+      allFindings.push(altFinding);
+    }
 
     // 4. ENGINE 1: Contextual tone check via server-side Gemini
     let toneSummary = 'Tone evaluated against brand voice guidelines.';
@@ -102,13 +147,17 @@ export class GeminiService {
       console.warn('Tone check fallback triggered:', e);
     }
 
-    // 5. ENGINE 2: Extract factual and promotional claims
+    // 5. ENGINE 2: Extract factual and promotional claims (including text from visual assets)
+    const textForClaims = visual?.extractedText
+      ? `${content}\n\n[Graphic Promotional Copy]: ${visual.extractedText}`
+      : content;
+
     let claims: any[] = [];
     try {
       const res = await fetch('/api/gemini/claims-extract', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content }),
+        body: JSON.stringify({ content: textForClaims }),
       });
       if (res.ok) {
         const data = await res.json();
@@ -119,7 +168,7 @@ export class GeminiService {
     }
 
     // Fallback if claim extraction returned empty but text has content
-    if (!claims.length && content.trim().length > 15) {
+    if (!claims.length && textForClaims.trim().length > 15) {
       claims = [
         {
           id: 'claim-1',
@@ -131,21 +180,25 @@ export class GeminiService {
       ];
     }
 
-    // 6. ENGINE 2: BM25 retrieval over closed knowledge base per claim
-    const claimsWithChunks = claims.map((claim) => {
-      const query = `${claim.claimText} ${(claim.keywords || []).join(' ')}`;
-      const retrieved = BM25Retriever.retrieve(query, brandChunks, 3);
-      return {
-        claim,
-        retrievedChunks: retrieved.map((r) => ({
-          documentName: r.chunk.documentName,
-          section: r.chunk.section,
-          pageNumber: r.chunk.pageNumber,
-          text: r.chunk.text,
-          relevanceScore: Math.round(r.score * 100) / 100,
-        })),
-      };
-    });
+    // 6. ENGINE 2: Semantic vector similarity retrieval over closed knowledge base per claim
+    const claimsWithChunks = await Promise.all(
+      claims.map(async (claim) => {
+        const query = `${claim.claimText} ${(claim.keywords || []).join(' ')}`;
+        const retrieved = await VectorSimilarityRetriever.retrieve(query, brandChunks, 3);
+        return {
+          claim,
+          retrievedChunks: retrieved.map((r) => ({
+            documentName: r.chunk.documentName,
+            documentVersion: r.chunk.documentVersion || '1.0',
+            section: r.chunk.section,
+            pageNumber: r.chunk.pageNumber,
+            text: r.chunk.text,
+            relevanceScore: Math.round(r.score * 100) / 100,
+            matchType: r.matchType,
+          })),
+        };
+      })
+    );
 
     // 7. ENGINE 2: Verify claims against ONLY retrieved chunks
     let supportedCount = 0;
@@ -167,6 +220,25 @@ export class GeminiService {
         const verifications = data.verifications || [];
 
         for (const v of verifications) {
+          // Flag cross-document conflicts if detected between two approved documents
+          if (v.conflictsDetected && Array.isArray(v.conflictsDetected) && v.conflictsDetected.length > 0) {
+            for (const conflict of v.conflictsDetected) {
+              allFindings.push({
+                id: `ev-conflict-${allFindings.length + 1}`,
+                category: 'DOCUMENT_CONFLICT',
+                severity: 'Critical',
+                engine: 'Engine 2: Evidence Intelligence',
+                highlight: v.originalSpan,
+                explanation: `Cross-Document Conflict: ${conflict}`,
+                evidenceCitation: v.citation,
+                citedChunkText: v.citedChunkText,
+                conflictsDetected: v.conflictsDetected,
+                suggestedFix: 'Reconcile contradictory statements between internal approved knowledge base documents.',
+                status: 'Contradicted',
+              });
+            }
+          }
+
           if (v.status === 'Supported') {
             supportedCount++;
           } else if (v.status === 'Contradicted') {
@@ -185,7 +257,7 @@ export class GeminiService {
               status: 'Contradicted',
             });
           } else {
-            // Unverified (missing evidence)
+            // Unverified (missing evidence) - never stated as false
             unverifiedCount++;
             allFindings.push({
               id: `ev-unver-${allFindings.length + 1}`,
@@ -296,160 +368,12 @@ export class GeminiService {
   }
 
   /**
-   * Visual Intelligence Lite: Extract dominant colors via HTML5 Canvas
-   * and call OCR via Gemini
+   * Visual Intelligence: Delegate to VisualIntelligenceEngine (Engine 3)
    */
   public static async analyzeVisualAsset(
     imageFile: File,
     brand: Brand
   ): Promise<VisualAnalysisResult> {
-    const imageUrl = URL.createObjectURL(imageFile);
-    const dominantColors = await this.sampleCanvasColors(imageFile);
-
-    // Color distance math against brand palette
-    const targetColors = [
-      { target: 'Primary' as const, brandHex: brand.brandColors.primary },
-      { target: 'Secondary' as const, brandHex: brand.brandColors.secondary },
-      { target: 'Accent' as const, brandHex: brand.brandColors.accent },
-    ];
-
-    const paletteMatches = targetColors.map((target) => {
-      // Find closest detected color
-      let minDistance = 9999;
-      let closestHex = dominantColors[0]?.hex || '#000000';
-
-      for (const detected of dominantColors) {
-        const dist = this.colorDistance(target.brandHex, detected.hex);
-        if (dist < minDistance) {
-          minDistance = dist;
-          closestHex = detected.hex;
-        }
-      }
-
-      // If distance < 45, it is considered compliant
-      const isCompliant = minDistance < 48;
-      return {
-        target: target.target,
-        brandHex: target.brandHex,
-        detectedHex: closestHex,
-        distance: Math.round(minDistance),
-        isCompliant,
-      };
-    });
-
-    const compliantCount = paletteMatches.filter((p) => p.isCompliant).length;
-    const complianceScore = Math.round((compliantCount / paletteMatches.length) * 100);
-
-    const potentialIssues: string[] = [];
-    if (complianceScore < 66) {
-      potentialIssues.push(
-        'Dominant color spectrum diverges from official approved brand hex palette.'
-      );
-    }
-
-    // OCR via Gemini
-    let extractedText = '';
-    let altTextSuggestion = '';
-    try {
-      const base64 = await this.fileToBase64(imageFile);
-      const res = await fetch('/api/gemini/ocr-image', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          imageBase64: base64,
-          mimeType: imageFile.type,
-        }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        extractedText = data.extractedText || '';
-        altTextSuggestion = data.altTextSuggestion || '';
-      }
-    } catch (e) {
-      console.warn('OCR error:', e);
-    }
-
-    return {
-      imageUrl,
-      dominantColors,
-      paletteMatches,
-      complianceScore,
-      extractedText,
-      altTextSuggestion,
-      potentialIssues,
-      analyzedAt: new Date().toISOString(),
-    };
-  }
-
-  private static fileToBase64(file: File): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
-  }
-
-  private static sampleCanvasColors(
-    file: File
-  ): Promise<{ hex: string; percent: number }[]> {
-    return new Promise((resolve) => {
-      const img = new Image();
-      const url = URL.createObjectURL(file);
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d');
-        canvas.width = 100;
-        canvas.height = 100;
-        if (!ctx) {
-          resolve([{ hex: '#0F172A', percent: 60 }, { hex: '#2563EB', percent: 40 }]);
-          return;
-        }
-
-        ctx.drawImage(img, 0, 0, 100, 100);
-        const data = ctx.getImageData(0, 0, 100, 100).data;
-        const colorCounts: Record<string, number> = {};
-
-        for (let i = 0; i < data.length; i += 16) {
-          const r = Math.round(data[i] / 32) * 32;
-          const g = Math.round(data[i + 1] / 32) * 32;
-          const b = Math.round(data[i + 2] / 32) * 32;
-          const hex = `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`;
-          colorCounts[hex] = (colorCounts[hex] || 0) + 1;
-        }
-
-        const totalSamples = Object.values(colorCounts).reduce((a, b) => a + b, 0);
-        const sorted = Object.entries(colorCounts)
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 5)
-          .map(([hex, count]) => ({
-            hex,
-            percent: Math.round((count / (totalSamples || 1)) * 100),
-          }));
-
-        resolve(sorted.length ? sorted : [{ hex: '#0F172A', percent: 100 }]);
-        URL.revokeObjectURL(url);
-      };
-      img.onerror = () => {
-        resolve([{ hex: '#0F172A', percent: 100 }]);
-      };
-      img.src = url;
-    });
-  }
-
-  private static colorDistance(hex1: string, hex2: string): number {
-    const parse = (hex: string) => {
-      const clean = hex.replace('#', '');
-      return {
-        r: parseInt(clean.substring(0, 2), 16) || 0,
-        g: parseInt(clean.substring(2, 4), 16) || 0,
-        b: parseInt(clean.substring(4, 6), 16) || 0,
-      };
-    };
-    const c1 = parse(hex1);
-    const c2 = parse(hex2);
-    return Math.sqrt(
-      Math.pow(c1.r - c2.r, 2) + Math.pow(c1.g - c2.g, 2) + Math.pow(c1.b - c2.b, 2)
-    );
+    return VisualIntelligenceEngine.analyzeImage(imageFile, brand);
   }
 }

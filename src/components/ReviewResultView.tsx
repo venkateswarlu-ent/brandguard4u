@@ -65,7 +65,7 @@ export const ReviewResultView: React.FC<ReviewResultViewProps> = ({
 
   // Filters
   const [severityFilter, setSeverityFilter] = useState<'ALL' | Severity>('ALL');
-  const [engineFilter, setEngineFilter] = useState<'ALL' | 'Engine 1' | 'Engine 2'>('ALL');
+  const [engineFilter, setEngineFilter] = useState<'ALL' | 'Engine 1' | 'Engine 2' | 'Engine 3'>('ALL');
 
   // AI Revision Diff View State
   const [activeTab, setActiveTab] = useState<'findings' | 'diff' | 'visual'>('findings');
@@ -83,16 +83,25 @@ export const ReviewResultView: React.FC<ReviewResultViewProps> = ({
   const [showRequestChangesModal, setShowRequestChangesModal] = useState(false);
   const [reviewerComment, setReviewerComment] = useState('');
 
+  // Reviewer Critical Override Modal State
+  const [showOverrideModal, setShowOverrideModal] = useState(false);
+  const [overrideJustification, setOverrideJustification] = useState('');
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+
   // Load or trigger analysis
   const runAnalysis = async () => {
     if (!submission || !currentVersion || !brand) return;
     setIsAnalyzing(true);
+    setAnalysisError(null);
     try {
       const result = await GeminiService.analyzeContent(
         currentVersion.content,
         brand,
         submission.id,
-        currentVersion.versionNumber
+        currentVersion.versionNumber,
+        {
+          visualAnalysis: submission.visualAnalysis,
+        }
       );
       setAnalysis(result);
 
@@ -100,8 +109,9 @@ export const ReviewResultView: React.FC<ReviewResultViewProps> = ({
       if (result.findings.length > 0) {
         setSelectedFindingId(result.findings[0].id);
       }
-    } catch (e) {
+    } catch (e: any) {
       console.error('Failed to run analysis:', e);
+      setAnalysisError(e?.message || 'Automated analysis failed. Click Retry to re-run.');
     } finally {
       setIsAnalyzing(false);
     }
@@ -110,11 +120,12 @@ export const ReviewResultView: React.FC<ReviewResultViewProps> = ({
   useEffect(() => {
     if (submission && currentVersion && brand) {
       setEditableContent(currentVersion.content);
+      const kbVersion = StorageService.getKnowledgeBaseVersion(brand.id);
       const hash = GeminiService.computeHash(
         currentVersion.content,
         brand.id,
         brand.guidelineVersion,
-        StorageService.getChunksByBrand(brand.id).length
+        kbVersion
       );
       const cached = StorageService.getAnalysis(hash);
       if (cached) {
@@ -142,11 +153,14 @@ export const ReviewResultView: React.FC<ReviewResultViewProps> = ({
     );
   }
 
+  const criticalFindings = (analysis?.findings || []).filter((f) => f.severity === 'Critical');
+
   // Filtered findings
   const filteredFindings = (analysis?.findings || []).filter((f) => {
     if (severityFilter !== 'ALL' && f.severity !== severityFilter) return false;
     if (engineFilter === 'Engine 1' && !f.engine.includes('Engine 1')) return false;
     if (engineFilter === 'Engine 2' && !f.engine.includes('Engine 2')) return false;
+    if (engineFilter === 'Engine 3' && !f.engine.includes('Engine 3')) return false;
     return true;
   });
 
@@ -215,30 +229,51 @@ export const ReviewResultView: React.FC<ReviewResultViewProps> = ({
     setActiveVersionIndex(updatedSubmission.versions.length - 1);
   };
 
-  // Reviewer: Approve content
-  const handleApprove = () => {
+  // Reviewer: Approve content with mandatory critical finding check
+  const handleApprove = (overrideNote?: string) => {
     if (currentRole === 'Creator') {
       alert('Only a designated Reviewer or Admin can approve content for publication.');
       return;
     }
 
-    const updated: Submission = {
-      ...submission,
-      status: 'Approved',
-      updatedAt: new Date().toISOString(),
-    };
-    StorageService.saveSubmission(updated);
+    if (!analysis || isAnalyzing) {
+      alert('Automated analysis must complete before content can be approved.');
+      return;
+    }
 
-    StorageService.addAuditEntry({
-      submissionId: submission.id,
-      brandId: brand.id,
-      role: currentRole,
-      actorName: `${currentRole} Reviewer`,
-      action: 'APPROVED',
-      details: `Approved content version v${currentVersion.versionNumber}.0 for final publication.`,
-    });
+    if (criticalFindings.length > 0 && !overrideNote) {
+      setShowOverrideModal(true);
+      return;
+    }
 
-    onRefreshData();
+    try {
+      const updated: Submission = {
+        ...submission,
+        status: 'Approved',
+        overrideJustification: overrideNote,
+        updatedAt: new Date().toISOString(),
+      };
+      StorageService.saveSubmission(updated);
+
+      const details = overrideNote
+        ? `Approved content v${currentVersion.versionNumber}.0 with Critical Finding Override: "${overrideNote}" (${criticalFindings.length} critical issues acknowledged).`
+        : `Approved content version v${currentVersion.versionNumber}.0 for final publication.`;
+
+      StorageService.addAuditEntry({
+        submissionId: submission.id,
+        brandId: brand.id,
+        role: currentRole,
+        actorName: `${currentRole} Reviewer`,
+        action: 'APPROVED',
+        details,
+      });
+
+      setShowOverrideModal(false);
+      setOverrideJustification('');
+      onRefreshData();
+    } catch (err: any) {
+      alert(`Approval Denied by Server Governance: ${err.message}`);
+    }
   };
 
   // Reviewer: Request changes
@@ -409,11 +444,31 @@ export const ReviewResultView: React.FC<ReviewResultViewProps> = ({
                     Request Changes
                   </button>
                   <button
-                    onClick={handleApprove}
-                    className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors inline-flex items-center gap-1.5 shadow-xs"
+                    onClick={() => handleApprove()}
+                    disabled={!analysis || isAnalyzing}
+                    className={`px-4 py-2 text-xs font-semibold text-white rounded-lg transition-colors inline-flex items-center gap-1.5 shadow-xs ${
+                      !analysis || isAnalyzing
+                        ? 'bg-slate-400 cursor-not-allowed opacity-60'
+                        : criticalFindings.length > 0
+                        ? 'bg-amber-600 hover:bg-amber-700 ring-2 ring-amber-300'
+                        : 'bg-emerald-600 hover:bg-emerald-700'
+                    }`}
+                    title={
+                      isAnalyzing
+                        ? 'Analysis is currently running...'
+                        : !analysis
+                        ? 'Automated analysis must complete before approval'
+                        : criticalFindings.length > 0
+                        ? `Warning: ${criticalFindings.length} critical finding(s) require justification to override`
+                        : 'Approve content for publication'
+                    }
                   >
-                    <CheckCircle2 className="w-4 h-4" />
-                    Approve Content
+                    {criticalFindings.length > 0 ? (
+                      <AlertTriangle className="w-4 h-4 text-amber-200" />
+                    ) : (
+                      <CheckCircle2 className="w-4 h-4" />
+                    )}
+                    {criticalFindings.length > 0 ? 'Approve with Override' : 'Approve Content'}
                   </button>
                 </>
               )}
@@ -439,6 +494,64 @@ export const ReviewResultView: React.FC<ReviewResultViewProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Analysis Running Loading State */}
+      {isAnalyzing && (
+        <div className="p-4 rounded-xl bg-blue-50 border border-blue-200 text-xs text-blue-900 flex items-center justify-between animate-pulse">
+          <div className="flex items-center gap-3">
+            <Sparkles className="w-5 h-5 text-blue-600 animate-spin shrink-0" />
+            <div>
+              <strong className="font-semibold">Executing Closed Governance Intelligence Pipeline...</strong>
+              <div className="text-[11px] text-blue-700 mt-0.5">
+                Evaluating Brand rules (Engine 1), verifying evidence citations (Engine 2), and inspecting visual color & logo compliance (Engine 3).
+              </div>
+            </div>
+          </div>
+          <span className="text-[11px] font-mono text-blue-600 font-semibold px-2.5 py-1 bg-white rounded border border-blue-200">
+            Running...
+          </span>
+        </div>
+      )}
+
+      {/* Analysis Error with Retry */}
+      {analysisError && !isAnalyzing && (
+        <div className="p-4 rounded-xl bg-rose-50 border border-rose-300 text-xs text-rose-900 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0" />
+            <div>
+              <strong className="font-semibold">Analysis Failed</strong>
+              <div className="text-[11px] text-rose-700 mt-0.5">{analysisError}</div>
+            </div>
+          </div>
+          <button
+            onClick={runAnalysis}
+            className="px-3 py-1.5 bg-rose-600 text-white rounded-lg font-semibold hover:bg-rose-700 transition-colors inline-flex items-center gap-1 shadow-xs"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            Retry Analysis
+          </button>
+        </div>
+      )}
+
+      {/* Prominent Critical Findings Warning Banner */}
+      {criticalFindings.length > 0 && submission.status !== 'Approved' && (
+        <div className="p-4 rounded-xl bg-amber-50 border border-amber-300 text-xs text-amber-950 flex items-start justify-between gap-3 shadow-xs">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <strong className="font-bold text-amber-900">
+                Critical Compliance Alert: {criticalFindings.length} Critical Issue{criticalFindings.length > 1 ? 's' : ''} Detected
+              </strong>
+              <p className="text-amber-800 leading-relaxed">
+                This content contains critical prohibited terms, unauthorized product names, or contradicted claims. In accordance with enterprise governance, Reviewer approval requires a mandatory written justification.
+              </p>
+            </div>
+          </div>
+          <span className="text-[10px] font-bold tracking-wider uppercase text-amber-800 bg-amber-100 border border-amber-300 px-2.5 py-1 rounded-md shrink-0">
+            Override Required
+          </span>
+        </div>
+      )}
 
       {/* Reviewer Comment Banner (if Changes Requested) */}
       {submission.reviewerComment && submission.status === 'Changes Requested' && (
@@ -721,7 +834,7 @@ export const ReviewResultView: React.FC<ReviewResultViewProps> = ({
 
                 <div className="flex items-center gap-1">
                   <span className="text-slate-400">Engine:</span>
-                  {(['ALL', 'Engine 1', 'Engine 2'] as const).map((eng) => (
+                  {(['ALL', 'Engine 1', 'Engine 2', 'Engine 3'] as const).map((eng) => (
                     <button
                       key={eng}
                       onClick={() => setEngineFilter(eng)}
@@ -933,47 +1046,88 @@ export const ReviewResultView: React.FC<ReviewResultViewProps> = ({
             </div>
           )}
 
-          {/* TAB 3: VISUAL INTELLIGENCE LITE */}
+          {/* TAB 3: VISUAL INTELLIGENCE (ENGINE 3) */}
           {activeTab === 'visual' && submission.visualAnalysis && (
             <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-xs space-y-5">
               <div>
-                <h3 className="text-sm font-bold text-slate-900">
-                  Visual Intelligence Lite: Graphic Inspection
+                <div className="flex items-center gap-2 text-xs font-semibold text-purple-600 uppercase tracking-wider mb-1">
+                  <span>Engine 3</span>
+                  <span>·</span>
+                  <span>Visual Intelligence Engine</span>
+                </div>
+                <h3 className="text-base font-bold text-slate-900">
+                  Graphic & Promotional Asset Verification
                 </h3>
-                <p className="text-xs text-slate-500">
-                  Dominant canvas color sampling against approved brand hex palette and OCR text extraction.
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Automated color palette sampling, logo reference verification, and OCR copy extraction. All visual findings are presented as potential issues for human review.
                 </p>
               </div>
 
-              <div className="flex flex-col sm:flex-row gap-4 items-start">
+              <div className="flex flex-col sm:flex-row gap-5 items-start">
                 <img
                   src={submission.visualAnalysis.imageUrl}
                   alt="Promotional Asset"
-                  className="w-48 h-32 object-cover rounded-lg border border-slate-200 shadow-xs shrink-0"
+                  className="w-52 h-36 object-cover rounded-lg border border-slate-200 shadow-xs shrink-0 bg-slate-100"
                 />
 
                 <div className="space-y-3 flex-1 text-xs">
-                  <div>
-                    <span className="font-semibold text-slate-700">Palette Compliance Score:</span>
-                    <div className="text-xl font-bold font-mono text-blue-600 mt-0.5">
-                      {submission.visualAnalysis.complianceScore}%
+                  <div className="flex items-center justify-between p-3 bg-slate-50 rounded-lg border border-slate-200">
+                    <div>
+                      <span className="font-semibold text-slate-700">Palette Compliance Score:</span>
+                      <div className="text-2xl font-bold font-mono text-blue-600 mt-0.5">
+                        {submission.visualAnalysis.complianceScore}%
+                      </div>
                     </div>
+                    <span className={`text-[11px] font-semibold px-2.5 py-1 rounded-full border ${
+                      submission.visualAnalysis.complianceScore >= 66
+                        ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                        : 'bg-amber-50 text-amber-800 border-amber-200'
+                    }`}>
+                      {submission.visualAnalysis.complianceScore >= 66 ? 'Compliant' : 'Potential Divergence'}
+                    </span>
+                  </div>
+
+                  {/* Logo Check Section */}
+                  <div className="p-3 bg-indigo-50/60 rounded-lg border border-indigo-200 text-indigo-950 space-y-1">
+                    <div className="flex items-center justify-between font-semibold">
+                      <span className="flex items-center gap-1.5">
+                        <ShieldCheck className="w-4 h-4 text-indigo-600" />
+                        Brand Logo Check:
+                      </span>
+                      <span className={`text-[10px] font-semibold px-2 py-0.5 rounded border ${
+                        !submission.visualAnalysis.logoCheck?.hasLogoConfigured
+                          ? 'bg-slate-100 text-slate-600 border-slate-200'
+                          : submission.visualAnalysis.logoCheck.isDetected
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          : 'bg-amber-50 text-amber-800 border-amber-200'
+                      }`}>
+                        {!submission.visualAnalysis.logoCheck?.hasLogoConfigured
+                          ? 'No Logo Configured'
+                          : submission.visualAnalysis.logoCheck.isDetected
+                          ? `Detected (${submission.visualAnalysis.logoCheck.similarityScore}%)`
+                          : 'Potential Mismatch'}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-700 leading-relaxed">
+                      {submission.visualAnalysis.logoCheck?.details ||
+                        (brand.logoUrl ? 'Reference logo compared.' : `No reference logo is currently uploaded for brand ${brand.name}.`)}
+                    </p>
                   </div>
 
                   {/* Palette Matches */}
                   <div className="space-y-1.5">
-                    <div className="font-semibold text-slate-700">Hex Palette Comparison:</div>
+                    <div className="font-semibold text-slate-700">Palette Match Details:</div>
                     {submission.visualAnalysis.paletteMatches.map((m, idx) => (
                       <div key={idx} className="flex items-center justify-between p-2 bg-slate-50 rounded border border-slate-200 text-[11px]">
                         <div className="flex items-center gap-2">
                           <span
-                            className="w-4 h-4 rounded border border-slate-300"
+                            className="w-4 h-4 rounded border border-slate-300 shadow-2xs"
                             style={{ backgroundColor: m.detectedHex }}
                           />
                           <span>{m.target} (Approved: {m.brandHex})</span>
                         </div>
-                        <span className={`font-medium ${m.isCompliant ? 'text-emerald-700' : 'text-amber-700'}`}>
-                          {m.isCompliant ? 'Compliant' : `Divergent (Δ ${m.distance})`}
+                        <span className={`font-semibold ${m.isCompliant ? 'text-emerald-700' : 'text-amber-700'}`}>
+                          {m.isCompliant ? 'Compliant' : `Potential Mismatch (Δ ${m.distance})`}
                         </span>
                       </div>
                     ))}
@@ -981,11 +1135,20 @@ export const ReviewResultView: React.FC<ReviewResultViewProps> = ({
 
                   {/* OCR Extracted Text */}
                   {submission.visualAnalysis.extractedText && (
-                    <div className="p-3 bg-purple-50/60 rounded border border-purple-200 text-purple-900 space-y-1">
-                      <div className="font-semibold text-[11px]">OCR Extracted Copy:</div>
-                      <p className="text-[11px] font-mono leading-normal">
+                    <div className="p-3 bg-purple-50/60 rounded-lg border border-purple-200 text-purple-900 space-y-1">
+                      <div className="font-semibold text-[11px] flex items-center justify-between">
+                        <span>OCR Extracted Text (Routed through Engines 1 & 2):</span>
+                        <span className="text-[10px] text-purple-700 font-mono">Tesseract / Vision Model</span>
+                      </div>
+                      <p className="text-[11px] font-mono leading-normal bg-white p-2 rounded border border-purple-100">
                         "{submission.visualAnalysis.extractedText}"
                       </p>
+                    </div>
+                  )}
+
+                  {submission.visualAnalysis.altTextSuggestion && (
+                    <div className="p-2.5 bg-slate-50 rounded border border-slate-200 text-[11px] text-slate-600">
+                      <strong className="text-slate-800">Suggested Alt-Text:</strong> {submission.visualAnalysis.altTextSuggestion}
                     </div>
                   )}
                 </div>
@@ -1038,6 +1201,76 @@ export const ReviewResultView: React.FC<ReviewResultViewProps> = ({
                 className="px-4 py-2 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-700 rounded-lg transition-colors shadow-xs"
               >
                 Send Feedback to Creator
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Critical Findings Override Justification Modal */}
+      {showOverrideModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-xl border border-rose-300 max-w-lg w-full p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between border-b border-rose-100 pb-3">
+              <h3 className="text-base font-bold text-rose-950 flex items-center gap-2">
+                <AlertTriangle className="w-5 h-5 text-rose-600" />
+                Override Critical Compliance Findings
+              </h3>
+              <button
+                onClick={() => setShowOverrideModal(false)}
+                className="text-slate-400 hover:text-slate-600 text-xl font-bold px-2"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs">
+              <p className="text-slate-700">
+                This content contains <strong className="text-rose-700">{criticalFindings.length} Critical finding(s)</strong> that violate approved brand guidelines or contradict evidence documents:
+              </p>
+
+              <div className="max-h-36 overflow-y-auto space-y-1.5 p-2 bg-rose-50/70 rounded-lg border border-rose-200">
+                {criticalFindings.map((cf) => (
+                  <div key={cf.id} className="text-[11px] text-rose-900 flex items-start gap-1.5">
+                    <span className="font-bold text-rose-700 shrink-0">•</span>
+                    <span>
+                      <strong>[{cf.category.replace(/_/g, ' ')}]</strong> "{cf.highlight}": {cf.explanation}
+                    </span>
+                  </div>
+                ))}
+              </div>
+
+              <div className="space-y-1.5 pt-1">
+                <label className="block font-semibold text-slate-800">
+                  Reviewer Override Justification <span className="text-rose-600">*</span>
+                </label>
+                <textarea
+                  rows={3}
+                  required
+                  placeholder="Explain why this content is approved despite critical findings (e.g. Legal exception granted, certified partner waiver, executive sign-off)..."
+                  value={overrideJustification}
+                  onChange={(e) => setOverrideJustification(e.target.value)}
+                  className="w-full text-xs bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-slate-900 focus:outline-none focus:ring-2 focus:ring-amber-500 font-sans"
+                />
+                <span className="text-[10px] text-slate-500">
+                  Minimum 10 characters required. This justification will be permanently recorded in the tamper-resistant audit trail.
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-200">
+              <button
+                onClick={() => setShowOverrideModal(false)}
+                className="px-3.5 py-1.5 text-xs text-slate-600 hover:text-slate-800"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => handleApprove(overrideJustification.trim())}
+                disabled={overrideJustification.trim().length < 10}
+                className="px-4 py-2 text-xs font-semibold text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg transition-colors shadow-xs"
+              >
+                Confirm Override & Approve
               </button>
             </div>
           </div>

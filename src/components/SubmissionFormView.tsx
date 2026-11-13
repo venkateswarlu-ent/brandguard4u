@@ -13,6 +13,7 @@ import { Brand, UserRole, Submission } from '../types';
 import { DocumentParser } from '../services/parser';
 import { StorageService } from '../services/storage';
 import { GeminiService } from '../services/gemini';
+import { VisualIntelligenceEngine } from '../services/visual';
 
 interface SubmissionFormViewProps {
   brands: Brand[];
@@ -43,6 +44,8 @@ export const SubmissionFormView: React.FC<SubmissionFormViewProps> = ({
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [parsingFile, setParsingFile] = useState(false);
+  const [missingAltCount, setMissingAltCount] = useState<number>(0);
+  const [parsedDocName, setParsedDocName] = useState<string>('');
 
   const selectedBrand = brands.find((b) => b.id === brandId) || brands[0];
 
@@ -54,6 +57,12 @@ export const SubmissionFormView: React.FC<SubmissionFormViewProps> = ({
     try {
       const parsed = await DocumentParser.parseFile(file);
       setContent(parsed.text);
+      setParsedDocName(file.name);
+      if (parsed.imagesWithoutAltCount && parsed.imagesWithoutAltCount > 0) {
+        setMissingAltCount(parsed.imagesWithoutAltCount);
+      } else {
+        setMissingAltCount(0);
+      }
       if (!title) {
         setTitle(file.name.replace(/\.[^/.]+$/, ''));
       }
@@ -81,6 +90,23 @@ export const SubmissionFormView: React.FC<SubmissionFormViewProps> = ({
     );
   };
 
+  const handleLoadNovaPayDemo = (type: 'clean' | 'messy') => {
+    setBrandId('brand-novapay');
+    if (type === 'clean') {
+      setTitle('NovaPay Seamless Merchant Settlements');
+      setChannel('Product Landing Page Copy');
+      setContent(
+        'NovaPay Starter delivers instant settlement at Rs 499 monthly fee with UPI enabled across 54 domestic banks. In our audited merchant survey, 78% of retail partners reported faster checkout completion.'
+      );
+    } else {
+      setTitle('NovaPay Unverified Hype Campaign (Messy)');
+      setChannel('LinkedIn Sponsored Post');
+      setContent(
+        "NovaPay Pro is the #1 best company in payments! We are 100% guaranteed zero failure, price is Rs 299/mo, credit cards supported with 99% merchant survey satisfaction."
+      );
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!content.trim() || !title.trim()) return;
@@ -97,6 +123,7 @@ export const SubmissionFormView: React.FC<SubmissionFormViewProps> = ({
       status: 'In Review',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      analysisStatus: 'running',
       versions: [
         {
           versionNumber: 1,
@@ -110,10 +137,11 @@ export const SubmissionFormView: React.FC<SubmissionFormViewProps> = ({
       ],
     };
 
-    // If promotional image attached, run Visual Intelligence Lite
+    // If promotional image attached, run Visual Intelligence Engine (Engine 3)
+    let visualResult = undefined;
     if (imageFile && selectedBrand) {
       try {
-        const visualResult = await GeminiService.analyzeVisualAsset(imageFile, selectedBrand);
+        visualResult = await VisualIntelligenceEngine.analyzeImage(imageFile, selectedBrand);
         newSubmission.visualAnalysis = visualResult;
       } catch (e) {
         console.warn('Visual analysis error:', e);
@@ -131,16 +159,22 @@ export const SubmissionFormView: React.FC<SubmissionFormViewProps> = ({
       details: `Created new submission "${title}" for automated closed-knowledge review.`,
     });
 
-    // Run Engine 1 & 2 analysis pipeline immediately
+    // Run Engine 1, 2 & 3 analysis pipeline automatically
     try {
       const analysis = await GeminiService.analyzeContent(
         content.trim(),
         selectedBrand,
         submissionId,
-        1
+        1,
+        {
+          visualAnalysis: visualResult,
+          missingAltTextCount: missingAltCount,
+          documentName: parsedDocName,
+        }
       );
 
-      // Update submission with risk score
+      // Update submission with risk score and completed status
+      newSubmission.analysisStatus = 'completed';
       newSubmission.versions[0].riskScore = analysis.riskScore;
       newSubmission.versions[0].findingsCount = analysis.findings.length;
       StorageService.saveSubmission(newSubmission);
@@ -153,8 +187,11 @@ export const SubmissionFormView: React.FC<SubmissionFormViewProps> = ({
         action: 'ANALYSIS_RUN',
         details: `Analysis complete: Risk Score ${analysis.riskScore}/100 with ${analysis.findings.length} findings identified.`,
       });
-    } catch (e) {
+    } catch (e: any) {
       console.error('Initial analysis run error:', e);
+      newSubmission.analysisStatus = 'failed';
+      newSubmission.analysisError = e?.message || 'Automated analysis encountered an error.';
+      StorageService.saveSubmission(newSubmission);
     } finally {
       setIsSubmitting(false);
       onSubmissionCreated(submissionId);
@@ -179,14 +216,35 @@ export const SubmissionFormView: React.FC<SubmissionFormViewProps> = ({
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={handleLoadDemoAd}
-          className="px-3.5 py-2 text-xs font-semibold text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-300 rounded-lg transition-colors inline-flex items-center gap-1.5 shadow-xs shrink-0"
-        >
-          <Zap className="w-4 h-4 text-amber-600" />
-          Load Benchmark Demo Ad
-        </button>
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={handleLoadDemoAd}
+            className="px-3 py-1.5 text-xs font-semibold text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-300 rounded-lg transition-colors inline-flex items-center gap-1 shadow-xs"
+            title="Load Acme Cloud test ad with deliberate violations"
+          >
+            <Zap className="w-3.5 h-3.5 text-amber-600" />
+            Acme Cloud Demo Ad
+          </button>
+          <button
+            type="button"
+            onClick={() => handleLoadNovaPayDemo('clean')}
+            className="px-3 py-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 rounded-lg transition-colors inline-flex items-center gap-1 shadow-xs"
+            title="Load NovaPay compliant content with verified citations"
+          >
+            <Zap className="w-3.5 h-3.5 text-emerald-600" />
+            NovaPay (Clean)
+          </button>
+          <button
+            type="button"
+            onClick={() => handleLoadNovaPayDemo('messy')}
+            className="px-3 py-1.5 text-xs font-semibold text-rose-800 bg-rose-50 hover:bg-rose-100 border border-rose-300 rounded-lg transition-colors inline-flex items-center gap-1 shadow-xs"
+            title="Load NovaPay content with planted violations (#1, Rs 299, credit cards, 99%)"
+          >
+            <Zap className="w-3.5 h-3.5 text-rose-600" />
+            NovaPay (Messy)
+          </button>
+        </div>
       </div>
 
       <form onSubmit={handleSubmit} className="bg-white rounded-xl border border-slate-200 p-6 shadow-xs space-y-6">

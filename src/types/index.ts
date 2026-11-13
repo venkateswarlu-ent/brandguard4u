@@ -1,5 +1,28 @@
 export type UserRole = 'Admin' | 'Creator' | 'Reviewer';
 
+export interface Organisation {
+  id: string;
+  name: string;
+  domain?: string;
+  createdAt: string;
+}
+
+export interface UserProfile {
+  id: string;
+  organisationId: string;
+  organisationName: string;
+  role: UserRole;
+  displayName: string;
+  email: string;
+  avatarUrl?: string;
+}
+
+export interface AuthSession {
+  user: UserProfile;
+  token: string;
+  isSupabaseConnected: boolean;
+}
+
 export interface BrandColors {
   primary: string;
   secondary: string;
@@ -8,6 +31,7 @@ export interface BrandColors {
 
 export interface Brand {
   id: string;
+  organisationId?: string;
   name: string;
   logoUrl?: string;
   brandColors: BrandColors;
@@ -25,6 +49,7 @@ export type DocumentType = 'guideline' | 'product_facts' | 'evidence' | 'pricing
 
 export interface KnowledgeDocument {
   id: string;
+  organisationId?: string;
   brandId: string;
   name: string;
   type: DocumentType;
@@ -37,13 +62,18 @@ export interface KnowledgeDocument {
 
 export interface KnowledgeChunk {
   id: string;
+  organisationId?: string;
   documentId: string;
   brandId: string;
   documentName: string;
+  documentVersion?: string;
   section: string;
   pageNumber?: number;
   text: string;
   tokenCount: number;
+  embedding?: number[];
+  embeddingModel?: string;
+  embeddedAt?: string;
 }
 
 export type SubmissionStatus = 'Draft' | 'In Review' | 'Changes Requested' | 'Approved';
@@ -58,6 +88,14 @@ export interface SubmissionVersion {
   findingsCount: number;
 }
 
+export interface LogoCheckResult {
+  checked: boolean;
+  hasLogoConfigured: boolean;
+  isDetected: boolean;
+  similarityScore: number;
+  details: string;
+}
+
 export interface VisualAnalysisResult {
   imageUrl: string;
   dominantColors: { hex: string; percent: number }[];
@@ -69,14 +107,17 @@ export interface VisualAnalysisResult {
     isCompliant: boolean;
   }[];
   complianceScore: number;
+  logoCheck?: LogoCheckResult;
   extractedText?: string;
   altTextSuggestion?: string;
   potentialIssues: string[];
+  findings?: Finding[];
   analyzedAt: string;
 }
 
 export interface Submission {
   id: string;
+  organisationId?: string;
   brandId: string;
   title: string;
   channel: string;
@@ -86,7 +127,11 @@ export interface Submission {
   createdAt: string;
   updatedAt: string;
   reviewerComment?: string;
+  overrideJustification?: string;
   visualAnalysis?: VisualAnalysisResult;
+  attachedImageFile?: string;
+  analysisStatus?: 'pending' | 'running' | 'completed' | 'failed';
+  analysisError?: string;
 }
 
 export type FindingCategory =
@@ -96,11 +141,17 @@ export type FindingCategory =
   | 'TONE_INCONSISTENCY'
   | 'CONTRADICTED_CLAIM'
   | 'UNVERIFIED_CLAIM'
-  | 'DOCUMENT_CONFLICT';
+  | 'DOCUMENT_CONFLICT'
+  | 'VISUAL_PALETTE_MISMATCH'
+  | 'VISUAL_LOGO_MISMATCH'
+  | 'VISUAL_ALT_TEXT_MISSING';
 
 export type Severity = 'Critical' | 'High' | 'Medium' | 'Low';
 
-export type EngineType = 'Engine 1: Brand Intelligence' | 'Engine 2: Evidence Intelligence';
+export type EngineType =
+  | 'Engine 1: Brand Intelligence'
+  | 'Engine 2: Evidence Intelligence'
+  | 'Engine 3: Visual Intelligence';
 
 export interface Finding {
   id: string;
@@ -146,6 +197,7 @@ export type AuditAction =
 
 export interface AuditEntry {
   id: string;
+  organisationId?: string;
   submissionId: string;
   brandId: string;
   timestamp: string;

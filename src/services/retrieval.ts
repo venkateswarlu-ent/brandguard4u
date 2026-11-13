@@ -16,6 +16,179 @@ const STOPWORDS = new Set([
 export interface ScoredChunk {
   chunk: KnowledgeChunk;
   score: number;
+  matchType?: 'semantic' | 'keyword' | 'hybrid';
+}
+
+// In-memory query embedding cache to avoid recomputing identical queries during a session
+const queryEmbeddingCache = new Map<string, number[]>();
+
+export class VectorSimilarityRetriever {
+  /**
+   * Calculates cosine similarity between two unit or non-unit vectors
+   */
+  public static cosineSimilarity(a: number[], b: number[]): number {
+    if (!a || !b || a.length === 0 || b.length === 0) return 0;
+    const len = Math.min(a.length, b.length);
+    let dot = 0;
+    let normA = 0;
+    let normB = 0;
+    for (let i = 0; i < len; i++) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    if (normA === 0 || normB === 0) return 0;
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+  }
+
+  /**
+   * Generates embeddings for an array of text snippets via server endpoint
+   */
+  public static async fetchEmbeddings(texts: string[]): Promise<{ embeddings: number[][]; model: string }> {
+    if (!texts.length) return { embeddings: [], model: 'none' };
+    try {
+      const endpoint = typeof window === 'undefined' ? 'http://localhost:3000/api/gemini/embeddings' : '/api/gemini/embeddings';
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ texts }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        return {
+          embeddings: data.embeddings || [],
+          model: data.model || 'text-embedding-004',
+        };
+      }
+    } catch (err) {
+      console.warn('Vector embedding fetch error:', err);
+    }
+
+    // Client-side deterministic dense fallback if network unavailable
+    return {
+      embeddings: texts.map((t) => this.generateClientFallbackEmbedding(t)),
+      model: 'client-deterministic-64',
+    };
+  }
+
+  /**
+   * Client-side 64-dim dense embedding generator (used as zero-latency offline fallback)
+   */
+  private static generateClientFallbackEmbedding(text: string): number[] {
+    const DIM = 64;
+    const vec = new Array(DIM).fill(0);
+    const clean = (text || '').toLowerCase().replace(/[^a-z0-9%$. -]/g, ' ');
+    const words = clean.split(/\s+/).filter((w) => w.length > 1);
+    for (const w of words) {
+      let h = 0;
+      for (let i = 0; i < w.length; i++) {
+        h = (h << 5) - h + w.charCodeAt(i);
+        h |= 0;
+      }
+      const idx = Math.abs(h) % DIM;
+      vec[idx] += (h & 1) === 0 ? 1 : -1;
+    }
+    const norm = Math.sqrt(vec.reduce((s, v) => s + v * v, 0));
+    return vec.map((v) => (norm > 0 ? v / norm : 0));
+  }
+
+  /**
+   * Generate and attach embeddings to chunks once when document is uploaded.
+   * Never recomputes unless documentVersion changes or forceRecompute is true.
+   */
+  public static async generateChunkEmbeddings(
+    chunks: KnowledgeChunk[],
+    documentVersion: string = '1.0',
+    forceRecompute: boolean = false
+  ): Promise<KnowledgeChunk[]> {
+    const chunksNeedingEmbeddings = chunks.filter(
+      (c) => forceRecompute || !c.embedding || c.embedding.length === 0 || c.documentVersion !== documentVersion
+    );
+
+    if (chunksNeedingEmbeddings.length === 0) {
+      return chunks;
+    }
+
+    const textsToEmbed = chunksNeedingEmbeddings.map((c) => `${c.section}: ${c.text}`);
+    const { embeddings, model } = await this.fetchEmbeddings(textsToEmbed);
+
+    const now = new Date().toISOString();
+    chunksNeedingEmbeddings.forEach((chunk, idx) => {
+      chunk.embedding = embeddings[idx] || this.generateClientFallbackEmbedding(chunk.text);
+      chunk.embeddingModel = model;
+      chunk.embeddedAt = now;
+      chunk.documentVersion = documentVersion;
+    });
+
+    return chunks;
+  }
+
+  /**
+   * Retrieve top-K chunks per claim using semantic vector cosine similarity
+   */
+  public static async retrieve(
+    query: string,
+    chunks: KnowledgeChunk[],
+    topK: number = 3
+  ): Promise<ScoredChunk[]> {
+    if (!chunks.length || !query.trim()) {
+      return [];
+    }
+
+    // 1. Ensure all chunks have embeddings
+    const needsEmbedding = chunks.some((c) => !c.embedding || c.embedding.length === 0);
+    if (needsEmbedding) {
+      await this.generateChunkEmbeddings(chunks);
+    }
+
+    // 2. Obtain query embedding (with session cache)
+    const normalizedQuery = query.trim().toLowerCase();
+    let queryVec = queryEmbeddingCache.get(normalizedQuery);
+    if (!queryVec) {
+      const res = await this.fetchEmbeddings([query]);
+      if (res.embeddings.length > 0) {
+        queryVec = res.embeddings[0];
+        queryEmbeddingCache.set(normalizedQuery, queryVec);
+      } else {
+        queryVec = this.generateClientFallbackEmbedding(query);
+      }
+    }
+
+    // 3. Compute cosine similarity for each chunk
+    const scored: ScoredChunk[] = chunks.map((chunk) => {
+      const chunkVec = chunk.embedding && chunk.embedding.length > 0
+        ? chunk.embedding
+        : this.generateClientFallbackEmbedding(chunk.text);
+
+      const sim = this.cosineSimilarity(queryVec!, chunkVec);
+      return {
+        chunk,
+        score: Math.max(0, Math.round(sim * 1000) / 1000),
+        matchType: 'semantic',
+      };
+    });
+
+    // Sort descending by vector similarity
+    const sorted = scored
+      .filter((s) => s.score > 0.05)
+      .sort((a, b) => b.score - a.score);
+
+    // If top vector match has low confidence, augment with keyword signals to prevent miss
+    if (sorted.length < topK) {
+      const bm25Results = BM25Retriever.retrieve(query, chunks, topK);
+      for (const bRes of bm25Results) {
+        if (!sorted.some((s) => s.chunk.id === bRes.chunk.id)) {
+          sorted.push({
+            chunk: bRes.chunk,
+            score: Math.min(0.5, bRes.score / 10),
+            matchType: 'hybrid',
+          });
+        }
+      }
+    }
+
+    return sorted.slice(0, topK);
+  }
 }
 
 export class BM25Retriever {
@@ -94,6 +267,7 @@ export class BM25Retriever {
       return {
         chunk,
         score,
+        matchType: 'keyword',
       };
     });
 

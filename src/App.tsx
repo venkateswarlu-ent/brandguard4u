@@ -8,7 +8,8 @@ import { ReviewResultView } from './components/ReviewResultView';
 import { ApprovalQueueView } from './components/ApprovalQueueView';
 import { AuditHistoryView } from './components/AuditHistoryView';
 import { StorageService } from './services/storage';
-import { Brand, UserRole, SessionUsage, Submission } from './types';
+import { AuthService } from './services/auth';
+import { Brand, UserRole, SessionUsage, Submission, UserProfile } from './types';
 
 export default function App() {
   // Initialize seed demo data if not yet initialized
@@ -16,33 +17,52 @@ export default function App() {
     StorageService.initialize();
   }, []);
 
+  const [currentUser, setCurrentUser] = useState<UserProfile>(() => AuthService.getCurrentUser());
   const [brands, setBrands] = useState<Brand[]>(() => StorageService.getBrands());
   const [selectedBrandId, setSelectedBrandId] = useState<string>(() => {
     const list = StorageService.getBrands();
-    return list[0]?.id || 'brand-acme-cloud';
+    return list[0]?.id || 'brand-novapay';
   });
 
-  const [currentRole, setCurrentRole] = useState<UserRole>('Reviewer');
   const [currentTab, setCurrentTab] = useState<string>('dashboard');
-  const [selectedSubmissionId, setSelectedSubmissionId] = useState<string>('sub-acme-q1-campaign');
+  const [selectedSubmissionId, setSelectedSubmissionId] = useState<string>('sub-novapay-merchant-campaign');
   const [credits, setCredits] = useState<SessionUsage>(() => StorageService.getSessionCredits());
   const [refreshKey, setRefreshKey] = useState<number>(0);
 
   const refreshData = () => {
-    setBrands(StorageService.getBrands());
+    const user = AuthService.getCurrentUser();
+    setCurrentUser(user);
+    const orgBrands = StorageService.getBrands(user.organisationId);
+    setBrands(orgBrands);
+    if (!orgBrands.some((b) => b.id === selectedBrandId)) {
+      setSelectedBrandId(orgBrands[0]?.id || '');
+    }
     setCredits(StorageService.getSessionCredits());
+    setRefreshKey((prev) => prev + 1);
+  };
+
+  const handleSwitchUser = async (profileId: string) => {
+    const updatedUser = await AuthService.switchProfile(profileId);
+    setCurrentUser(updatedUser);
+    const orgBrands = StorageService.getBrands(updatedUser.organisationId);
+    setBrands(orgBrands);
+    setSelectedBrandId(orgBrands[0]?.id || '');
+    const orgSubmissions = StorageService.getSubmissions(undefined, updatedUser.organisationId);
+    if (orgSubmissions.length > 0) {
+      setSelectedSubmissionId(orgSubmissions[0].id);
+    }
     setRefreshKey((prev) => prev + 1);
   };
 
   const activeBrand = brands.find((b) => b.id === selectedBrandId) || brands[0];
   const submissions = StorageService.getSubmissions();
+  const currentRole = currentUser.role;
 
   // Quick Run Benchmark Demo Ad
   const handleRunDemoAd = () => {
     const existing = submissions.find(
       (s) =>
-        s.brandId === 'brand-acme-cloud' &&
-        s.versions.some((v) => v.content.includes("world's best platform"))
+        s.versions.some((v) => v.content.includes("world's best platform") || v.content.includes('NovaPay Pro'))
     );
 
     if (existing) {
@@ -53,9 +73,10 @@ export default function App() {
       const subId = `sub-demo-${Date.now()}`;
       const demoSub: Submission = {
         id: subId,
-        brandId: 'brand-acme-cloud',
-        title: 'Q1 Global Product Launch Headline',
-        channel: 'Social Ad & LinkedIn Sponsored Post',
+        organisationId: currentUser.organisationId,
+        brandId: activeBrand?.id || 'brand-novapay',
+        title: `${activeBrand?.name || 'NovaPay'} Benchmark Verification Ad`,
+        channel: 'Social Ad & Sponsored Post',
         currentVersion: 1,
         status: 'In Review',
         createdAt: new Date().toISOString(),
@@ -64,10 +85,12 @@ export default function App() {
           {
             versionNumber: 1,
             content:
-              "Acme Cloud is the world's best platform and improves productivity by 95%. Try AcmeCloud Pro today!",
+              activeBrand?.id === 'brand-novapay'
+                ? 'NovaPay Pro is the #1 guaranteed best payment gateway for credit cards at Rs 299 with 99% merchant satisfaction!'
+                : "Acme Cloud is the world's best platform and improves productivity by 95%. Try AcmeCloud Pro today!",
             submittedAt: new Date().toISOString(),
             submittedByRole: 'Creator',
-            submittedByName: 'Jordan Vance (Growth Marketing)',
+            submittedByName: currentUser.displayName,
             riskScore: 78,
             findingsCount: 4,
           },
@@ -89,8 +112,8 @@ export default function App() {
         brands={brands}
         selectedBrandId={selectedBrandId}
         onSelectBrand={(id) => setSelectedBrandId(id)}
-        currentRole={currentRole}
-        onSelectRole={(role) => setCurrentRole(role)}
+        currentUser={currentUser}
+        onSwitchUser={handleSwitchUser}
         credits={credits}
         onRefreshCredits={refreshData}
         onOpenNewSubmission={() => setCurrentTab('new-submission')}
@@ -188,11 +211,11 @@ export default function App() {
             <span>Closed-Knowledge Enterprise Brand Governance</span>
           </div>
           <div className="flex items-center gap-4 text-slate-400">
-            <span>Deterministic Rule Gatekeeper</span>
+            <span>Engine 1: Brand Rules & Tone</span>
             <span>·</span>
-            <span>BM25 Retrieval</span>
+            <span>Engine 2: Evidence Verification</span>
             <span>·</span>
-            <span>Gemini Evidence Intelligence</span>
+            <span>Engine 3: Visual Intelligence</span>
           </div>
         </div>
       </footer>

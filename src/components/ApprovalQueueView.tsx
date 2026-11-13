@@ -54,23 +54,34 @@ export const ApprovalQueueView: React.FC<ApprovalQueueViewProps> = ({
       return;
     }
 
-    const updated: Submission = {
-      ...sub,
-      status: 'Approved',
-      updatedAt: new Date().toISOString(),
-    };
-    StorageService.saveSubmission(updated);
+    const latestVer = sub.versions[sub.versions.length - 1];
+    if ((latestVer?.riskScore ?? 0) >= 60) {
+      alert('This submission has Critical findings. Enterprise policy requires reviewing findings and providing an override justification.');
+      onOpenSubmission(sub.id);
+      return;
+    }
 
-    StorageService.addAuditEntry({
-      submissionId: sub.id,
-      brandId: sub.brandId,
-      role: currentRole,
-      actorName: `${currentRole} Reviewer`,
-      action: 'APPROVED',
-      details: `Quick-approved content "${sub.title}" from queue.`,
-    });
+    try {
+      const updated: Submission = {
+        ...sub,
+        status: 'Approved',
+        updatedAt: new Date().toISOString(),
+      };
+      StorageService.saveSubmission(updated);
 
-    onRefreshData();
+      StorageService.addAuditEntry({
+        submissionId: sub.id,
+        brandId: sub.brandId,
+        role: currentRole,
+        actorName: `${currentRole} Reviewer`,
+        action: 'APPROVED',
+        details: `Quick-approved content "${sub.title}" from queue.`,
+      });
+
+      onRefreshData();
+    } catch (err: any) {
+      alert(`Approval Denied: ${err.message}`);
+    }
   };
 
   return (
@@ -198,10 +209,15 @@ export const ApprovalQueueView: React.FC<ApprovalQueueViewProps> = ({
                         {sub.status !== 'Approved' && currentRole !== 'Creator' && (
                           <button
                             onClick={(e) => handleQuickApprove(e, sub)}
-                            className="px-2.5 py-1 text-xs font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded transition-colors inline-flex items-center gap-1"
+                            className={`px-2.5 py-1 text-xs font-semibold rounded transition-colors inline-flex items-center gap-1 border ${
+                              riskScore >= 60
+                                ? 'text-amber-800 bg-amber-50 hover:bg-amber-100 border-amber-300'
+                                : 'text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border-emerald-200'
+                            }`}
+                            title={riskScore >= 60 ? 'Critical findings exist: click to review and justify' : 'Quick-approve compliant content'}
                           >
                             <Check className="w-3 h-3" />
-                            Approve
+                            {riskScore >= 60 ? 'Review & Override' : 'Approve'}
                           </button>
                         )}
                         <button

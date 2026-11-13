@@ -1,29 +1,36 @@
 import { Brand, Finding } from '../types';
 
 export class DeterministicRulesEngine {
+  private static buildBoundaryRegex(phrase: string): RegExp {
+    const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const startBoundary = /^\w/.test(phrase) ? '\\b' : '(?<!\\w)';
+    const endBoundary = /\w$/.test(phrase) ? '\\b' : '(?!\\w)';
+    return new RegExp(`${startBoundary}${escaped}${endBoundary}`, 'gi');
+  }
+
   /**
    * Run all deterministic Brand Intelligence checks (zero LLM calls)
    */
-  public static evaluate(content: string, brand: Brand): Finding[] {
+  public static evaluate(content: string, brand: Brand, prefixLabel: string = ''): Finding[] {
     const findings: Finding[] = [];
+    const prefix = prefixLabel ? `[${prefixLabel}] ` : '';
 
     // 1. Check prohibited terms
     for (const term of brand.prohibitedTerms) {
       if (!term.trim()) continue;
-      const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const regex = new RegExp(`\\b${escaped}\\b`, 'gi');
+      const regex = this.buildBoundaryRegex(term);
       let match;
 
       while ((match = regex.exec(content)) !== null) {
         findings.push({
-          id: `det-prohibited-${match.index}`,
+          id: `det-prohibited-${match.index}-${Math.random().toString(36).substr(2, 4)}`,
           category: 'PROHIBITED_TERM',
           severity: 'Critical',
           engine: 'Engine 1: Brand Intelligence',
           highlight: match[0],
           startIndex: match.index,
           endIndex: match.index + match[0].length,
-          explanation: `The term "${match[0]}" is explicitly blacklisted in the ${brand.name} brand governance policy. Enterprise guidelines mandate verified architectural claims over absolute guarantees.`,
+          explanation: `${prefix}The term "${match[0]}" is explicitly blacklisted. Guideline Reference: ${brand.name} Brand Guidelines (v${brand.guidelineVersion}.0 - Prohibited Terms). Enterprise policy strictly mandates verified architectural claims over absolute guarantees.`,
           suggestedFix: this.getSuggestedProhibitedTermReplacement(match[0]),
         });
       }
@@ -32,8 +39,7 @@ export class DeterministicRulesEngine {
     // 2. Check prohibited superlative patterns
     for (const pattern of brand.prohibitedPatterns) {
       if (!pattern.trim()) continue;
-      const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const regex = new RegExp(`\\b${escaped}\\b`, 'gi');
+      const regex = this.buildBoundaryRegex(pattern);
       let match: RegExpExecArray | null;
 
       while ((match = regex.exec(content)) !== null) {
@@ -48,14 +54,14 @@ export class DeterministicRulesEngine {
         );
         if (!alreadyFlagged) {
           findings.push({
-            id: `det-superlative-${matchIndex}`,
+            id: `det-superlative-${matchIndex}-${Math.random().toString(36).substr(2, 4)}`,
             category: 'SUPERLATIVE',
             severity: 'High',
             engine: 'Engine 1: Brand Intelligence',
             highlight: matchText,
             startIndex: matchIndex,
             endIndex: matchIndex + matchText.length,
-            explanation: `Unsupported superlative "${matchText}" violates B2B compliance. Marketing claims must use empirical metrics or peer-reviewed benchmarks rather than unsubstantiated supremacy statements.`,
+            explanation: `${prefix}Unsupported superlative "${matchText}" violates corporate compliance. Guideline Reference: ${brand.name} Brand Guidelines (v${brand.guidelineVersion}.0 - Superlatives & Supremacy Claims). Marketing claims must use empirical metrics or peer-reviewed benchmarks rather than unsubstantiated supremacy statements.`,
             suggestedFix: this.getSuggestedSuperlativeReplacement(matchText),
           });
         }
@@ -80,7 +86,7 @@ export class DeterministicRulesEngine {
           highlight: match[0],
           startIndex: match.index,
           endIndex: match.index + match[0].length,
-          explanation: `Brand name formatting error: "${match[0]}" should be formatted with proper brand spacing as "${brandName}".`,
+          explanation: `${prefix}Brand name formatting error: "${match[0]}" should be formatted with proper brand spacing as "${brandName}". Guideline Reference: ${brandName} Brand Guidelines (v${brand.guidelineVersion}.0 - Approved Product Names).`,
           suggestedFix: brandName,
         });
       }
@@ -107,7 +113,7 @@ export class DeterministicRulesEngine {
           highlight: candidateName,
           startIndex: suffixMatch.index,
           endIndex: suffixMatch.index + candidateName.length,
-          explanation: `Unauthorized product designation: "${candidateName}" is not an officially approved commercial offering in the ${brandName} catalog. Approved products are: ${brand.approvedProductNames.join(', ')}.`,
+          explanation: `${prefix}Unauthorized product designation: "${candidateName}" is not an officially approved commercial offering in the ${brandName} catalog. Guideline Reference: ${brandName} Brand Guidelines (v${brand.guidelineVersion}.0 - Product Catalog). Approved products are: ${brand.approvedProductNames.join(', ')}.`,
           suggestedFix: brand.approvedProductNames[0] || brandName,
         });
       }

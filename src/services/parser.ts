@@ -4,20 +4,48 @@ import { KnowledgeChunk } from '../types';
 export interface ParsedDocumentResult {
   text: string;
   chunks: Omit<KnowledgeChunk, 'id' | 'documentId' | 'brandId'>[];
+  embeddedImagesCount?: number;
+  imagesWithoutAltCount?: number;
 }
 
 export class DocumentParser {
   /**
-   * Parse in-browser file: PDF, DOCX, TXT, MD
+   * Parse in-browser file: PDF, DOCX, TXT, MD, HTML
    */
   public static async parseFile(file: File): Promise<ParsedDocumentResult> {
     const fileName = file.name.toLowerCase();
 
     let rawText = '';
+    let embeddedImagesCount = 0;
+    let imagesWithoutAltCount = 0;
+
     if (fileName.endsWith('.docx')) {
       const arrayBuffer = await file.arrayBuffer();
       const result = await mammoth.extractRawText({ arrayBuffer });
       rawText = result.value;
+      try {
+        const htmlRes = await mammoth.convertToHtml({ arrayBuffer });
+        const imgTags = htmlRes.value.match(/<img\b[^>]*>/gi) || [];
+        embeddedImagesCount = imgTags.length;
+        for (const img of imgTags) {
+          const altMatch = img.match(/alt\s*=\s*["']([^"']*)["']/i);
+          if (!altMatch || !altMatch[1].trim()) {
+            imagesWithoutAltCount++;
+          }
+        }
+      } catch (e) {
+        console.warn('DOCX image inspection fallback:', e);
+      }
+    } else if (fileName.endsWith('.html') || fileName.endsWith('.htm')) {
+      rawText = await file.text();
+      const imgTags = rawText.match(/<img\b[^>]*>/gi) || [];
+      embeddedImagesCount = imgTags.length;
+      for (const img of imgTags) {
+        const altMatch = img.match(/alt\s*=\s*["']([^"']*)["']/i);
+        if (!altMatch || !altMatch[1].trim()) {
+          imagesWithoutAltCount++;
+        }
+      }
     } else if (fileName.endsWith('.pdf')) {
       rawText = await this.extractPdfText(file);
     } else {
@@ -31,6 +59,8 @@ export class DocumentParser {
     return {
       text: cleanText,
       chunks,
+      embeddedImagesCount,
+      imagesWithoutAltCount,
     };
   }
 

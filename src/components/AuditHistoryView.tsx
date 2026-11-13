@@ -97,12 +97,16 @@ export const AuditHistoryView: React.FC<AuditHistoryViewProps> = ({
             <span>Module 9</span>
             <span>·</span>
             <span>Compliance & Audit Trail</span>
+            <span>·</span>
+            <span className="text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full font-mono text-[10px]">
+              Tamper-Resistant / Insert-Only
+            </span>
           </div>
           <h1 className="text-2xl font-bold text-slate-900 tracking-tight">
             Governance Audit Timeline
           </h1>
           <p className="text-xs text-slate-500 mt-1">
-            Immutable log of all content submissions, analysis evaluations, comments, and reviewer approvals.
+            Immutable log of all content submissions, automated evaluations, revision drafts, and reviewer approvals. Enforced with insert-only database permissions.
           </p>
         </div>
 
